@@ -2990,4 +2990,61 @@ mod tests {
 
         network_service_handle.abort();
     }
+
+    /// A pending transaction must wake the manager even when the previous poll drained the
+    /// pending-hash channel without seeing it empty. Without this, on a network with no other
+    /// gossip, locally submitted transactions are never announced.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_pending_txs_wake_manager_after_partial_drain() {
+        use std::{
+            sync::atomic::{AtomicUsize, Ordering::SeqCst},
+            task::{Context, Wake, Waker},
+        };
+
+        struct CountingWaker(AtomicUsize);
+        impl Wake for CountingWaker {
+            fn wake(self: Arc<Self>) {
+                self.0.fetch_add(1, SeqCst);
+            }
+            fn wake_by_ref(self: &Arc<Self>) {
+                self.0.fetch_add(1, SeqCst);
+            }
+        }
+
+        let secret_key = SecretKey::new(&mut rand_08::thread_rng());
+        let pool = testing_pool();
+        let config =
+            NetworkConfigBuilder::<reth_eth_wire_types::EthNetworkPrimitives>::new(secret_key)
+                .disable_discovery()
+                .listener_port(0)
+                .build(NoopProvider::default());
+        let transactions_manager_config = config.transactions_manager_config.clone();
+        let (network_handle, _network, mut transactions, _) = NetworkManager::new(config)
+            .await
+            .unwrap()
+            .into_builder()
+            .transactions(pool.clone(), transactions_manager_config)
+            .split_with_handle();
+        network_handle.update_sync_state(SyncState::Idle);
+
+        let wakes = Arc::new(CountingWaker(AtomicUsize::new(0)));
+        let waker = Waker::from(wakes.clone());
+        let mut cx = Context::from_waker(&waker);
+
+        // The pending-hash channel is empty, so this poll registers the waker on it.
+        assert!(transactions.poll_unpin(&mut cx).is_pending());
+
+        for nth in ["first", "second", "third"] {
+            let before = wakes.0.load(SeqCst);
+            pool.add_transaction(
+                reth_transaction_pool::TransactionOrigin::External,
+                MockTransaction::eip1559(),
+            )
+            .await
+            .unwrap();
+            assert!(wakes.0.load(SeqCst) > before, "{nth} pending tx did not wake the manager");
+            // The woken manager drains exactly the new hash.
+            assert!(transactions.poll_unpin(&mut cx).is_pending());
+        }
+    }
 }
